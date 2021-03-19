@@ -1,4 +1,5 @@
 #include "log.h"
+#include "queue.h"
 
 // system headers ofr I/O, networking, threading
 #include <stdio.h>
@@ -22,8 +23,11 @@
 #define HDR_200 "HTTP/1.0 200 OK\r\n\r\n"
 #define HDR_404 "HTTP/1.0 404 NOT FOUND\r\n\r\n"
 
-// maximum number of awaiting requests required
-#define MAX_BACKLOG 10
+// set the number of worker threads
+#define POOL_SIZE 10
+
+// mutex to prevent clobbering the worker queue
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 
 // global variables so that they can be reached by the signal teardown handler
 int server_fd;
@@ -32,10 +36,10 @@ char *log_path = NULL;
 
 // callback function for the signal handler - has to take an integer parameter
 void teardown(int dummy) {
-    close(server_fd);
     if (logging) {
         log_msg(log_path, "Interrupt received, closing server socket");
     }
+    close(server_fd);
     exit(EXIT_SUCCESS);
 }
 
@@ -47,11 +51,7 @@ void check(int return_value, char *description) {
     }
 }
 
-// thread handler, must take and return void pointers
-void *handle_connection(void *client_ptr) {
-    // cast file descriptor back into an integer
-    int client_fd = *(int *) client_ptr;
-
+void handle_connection(int client_fd) {
     // parse the client request
     char req_header[MAX_LINE];
     char method[MAX_ATTR];
@@ -93,13 +93,25 @@ void *handle_connection(void *client_ptr) {
 
     if (logging) {
         char msg[MAX_LINE];
-        sprintf(msg, "Response - resource: %s, sent: %ldb", resource, total);
+        sprintf(msg, "Resource: %s, sent: %ldb", resource, total);
         log_msg(log_path, msg);
     }
 
     close(client_fd);
+}
 
-    return NULL;
+// thread function keeps polling the queue to check for new clients
+void *thread_work(void *dummy) {
+    while (true) {
+        // critical region, lock to avoid corruption
+        pthread_mutex_lock(&mtx);
+        int client_fd = dequeue();
+        pthread_mutex_unlock(&mtx);
+
+        if (client_fd != -1) {
+            handle_connection(client_fd);
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -126,7 +138,7 @@ int main(int argc, char **argv) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     check(bind(server_fd, (struct sockaddr *) &addr, sizeof(addr)), "At bind");
-    check(listen(server_fd, MAX_BACKLOG), "At bind");
+    check(listen(server_fd, POOL_SIZE), "At bind");
 
     if (logging) {
         char msg[MAX_LINE];
@@ -134,15 +146,20 @@ int main(int argc, char **argv) {
         log_msg(log_path, msg);
     }
 
+    // intialise worker threads
+    pthread_t pool[POOL_SIZE];
+    for (int i = 0; i < POOL_SIZE; i++) {
+        pthread_create(&pool[i], NULL, &thread_work, NULL);
+    }
+
     // keep accepting new connections until interrupted
     signal(SIGINT, &teardown);
     signal(SIGKILL, &teardown);
-    while (1) {
+    while (true) {
         int client_fd = accept(server_fd, NULL, NULL);
-    
-        // spawn a thread to handle the connection
-        pthread_t thread;
-        pthread_create(&thread, NULL, &handle_connection, &client_fd);
+
+        // threads are waiting for new clients to be queued
+        enqueue(client_fd);
     }
 
     return EXIT_SUCCESS;
